@@ -17,9 +17,17 @@ const xrayRoutes = require("./routes/xray");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// CORS configuration - Allow all origins
+const corsOptions = {
+  origin: "*", // Allow all origins
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  credentials: false, // Set to false when using origin: "*"
+};
+
 // Middleware
 app.use(helmet());
-app.use(cors());
+app.use(cors(cors));
 app.use(express.json());
 
 // Swagger configuration
