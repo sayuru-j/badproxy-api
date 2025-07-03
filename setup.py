@@ -6,7 +6,7 @@ from pathlib import Path
 def install_dependencies():
     """Install Python dependencies"""
     print("Installing Python dependencies...")
-    subprocess.check_call([sys.executable, "-m", "pip3", "install", "-r", "requirements.txt"])
+    subprocess.check_call([sys.executable, "pip3", "install", "-r", "requirements.txt"])
 
 def create_directories():
     """Create necessary directories"""
