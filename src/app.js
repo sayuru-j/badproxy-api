@@ -1,0 +1,141 @@
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const swaggerJSDoc = require("swagger-jsdoc");
+const swaggerUi = require("swagger-ui-express");
+require("dotenv").config();
+
+const logger = require("./utils/logger");
+const errorHandler = require("./middleware/errorHandler");
+
+// Route imports
+const configRoutes = require("./routes/config");
+const userRoutes = require("./routes/users");
+const systemRoutes = require("./routes/system");
+const xrayRoutes = require("./routes/xray");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// Swagger configuration
+const swaggerOptions = {
+  definition: {
+    openapi: "3.0.0",
+    info: {
+      title: "Bad Proxy API",
+      version: "1.0.0",
+      description: "API for managing Xray VMess proxy configurations",
+    },
+    servers: [
+      {
+        url: `http://localhost:${PORT}`,
+        description: "Development server",
+      },
+    ],
+    components: {
+      schemas: {
+        User: {
+          type: "object",
+          required: ["email"],
+          properties: {
+            id: {
+              type: "string",
+              format: "uuid",
+              description: "User UUID",
+            },
+            email: {
+              type: "string",
+              format: "email",
+              description: "User email address",
+            },
+            alterId: {
+              type: "integer",
+              default: 0,
+              description: "VMess alter ID",
+            },
+            level: {
+              type: "integer",
+              default: 0,
+              description: "User level",
+            },
+            createdAt: {
+              type: "string",
+              format: "date-time",
+            },
+          },
+        },
+        XrayConfig: {
+          type: "object",
+          properties: {
+            log: {
+              type: "object",
+            },
+            inbounds: {
+              type: "array",
+              items: {
+                type: "object",
+              },
+            },
+            outbounds: {
+              type: "array",
+              items: {
+                type: "object",
+              },
+            },
+            routing: {
+              type: "object",
+            },
+          },
+        },
+        SystemStatus: {
+          type: "object",
+          properties: {
+            xrayStatus: {
+              type: "string",
+              enum: ["running", "stopped", "error"],
+            },
+            version: {
+              type: "string",
+            },
+            uptime: {
+              type: "string",
+            },
+            connections: {
+              type: "integer",
+            },
+          },
+        },
+      },
+    },
+  },
+  apis: ["./src/routes/*.js"],
+};
+
+const specs = swaggerJSDoc(swaggerOptions);
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(specs));
+
+// Routes
+app.use("/api/config", configRoutes);
+app.use("/api/users", userRoutes);
+app.use("/api/system", systemRoutes);
+app.use("/api/xray", xrayRoutes);
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// Error handling
+app.use(errorHandler);
+
+app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`);
+  logger.info(`Swagger UI available at http://localhost:${PORT}/api-docs`);
+});
+
+module.exports = app;
