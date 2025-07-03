@@ -27,7 +27,7 @@ const corsOptions = {
 
 // Middleware
 app.use(helmet());
-app.use(cors(cors));
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Swagger configuration
