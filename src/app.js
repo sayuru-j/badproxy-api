@@ -17,16 +17,36 @@ const xrayRoutes = require("./routes/xray");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS configuration - Allow all origins
+// Environment-based configuration
+const isDevelopment = process.env.NODE_ENV === 'development' || process.env.NODE_ENV !== 'production';
+
+// CORS configuration - Allow all origins in development
 const corsOptions = {
-  origin: "*", // Allow all origins
+  origin: isDevelopment ? "*" : ["https://yourdomain.com"], // Restrict in production
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-  credentials: false, // Set to false when using origin: "*"
+  credentials: !isDevelopment // Only allow credentials in production with specific origins
 };
 
-// Middleware
-app.use(helmet());
+// Middleware - Configure helmet based on environment
+app.use(helmet({
+  crossOriginOpenerPolicy: isDevelopment ? false : { policy: "same-origin" },
+  crossOriginResourcePolicy: isDevelopment ? false : { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: isDevelopment ? false : true,
+  contentSecurityPolicy: isDevelopment ? false : {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  hsts: isDevelopment ? false : {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
 app.use(cors(corsOptions));
 app.use(express.json());
 
@@ -41,8 +61,8 @@ const swaggerOptions = {
     },
     servers: [
       {
-        url: `http://localhost:${PORT}`,
-        description: "Development server",
+        url: isDevelopment ? `http://localhost:${PORT}` : `https://yourdomain.com`,
+        description: isDevelopment ? "Development server" : "Production server",
       },
     ],
     components: {
