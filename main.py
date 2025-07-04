@@ -192,9 +192,33 @@ def generate_user_config_links(email: str, uuid: str, protocol: str) -> Dict[str
         links["vless_ws"] = vless_ws_link
         
     elif protocol == "vmess":
-        # VMess WS TLS
-        vmess_link = f"vmess://{uuid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=/ws#{email}"
+        # VMess WS TLS - need to create proper VMess format
+        import base64
+        vmess_config = {
+            "v": "2",
+            "ps": email,
+            "add": domain,
+            "port": "443",
+            "id": uuid,
+            "aid": "0",
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": domain,
+            "path": "/ws",
+            "tls": "tls",
+            "sni": domain,
+            "alpn": "",
+            "fp": "chrome"
+        }
+        vmess_json = json.dumps(vmess_config)
+        vmess_base64 = base64.b64encode(vmess_json.encode()).decode().strip()
+        vmess_link = f"vmess://{vmess_base64}"
         links["vmess_ws"] = vmess_link
+        
+        # Also add a simpler VMess format for compatibility
+        vmess_simple = f"vmess://{uuid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=/ws&sni={domain}&fp=chrome#{email}"
+        links["vmess_ws_simple"] = vmess_simple
         
     elif protocol == "trojan":
         # Trojan TCP TLS
