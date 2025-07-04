@@ -171,6 +171,120 @@ def get_current_domain() -> str:
         pass
     return "localhost"
 
+def decode_vmess_link(vmess_link: str) -> Optional[Dict[str, Any]]:
+    """Decode VMess link and return JSON config"""
+    try:
+        if vmess_link.startswith("vmess://"):
+            import base64
+            encoded_part = vmess_link[8:]  # Remove "vmess://" prefix
+            decoded_json = base64.b64decode(encoded_part).decode('utf-8')
+            return json.loads(decoded_json)
+    except Exception as e:
+        logger.warning(f"Failed to decode VMess link: {e}")
+    return None
+
+def convert_vmess_to_v2ray_config(vmess_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert VMess subscription format to full V2Ray outbound config"""
+    return {
+        "outbounds": [{
+            "mux": {},
+            "protocol": "vmess",
+            "sendThrough": "0.0.0.0",
+            "settings": {
+                "vnext": [{
+                    "address": vmess_config.get("add", ""),
+                    "port": int(vmess_config.get("port", 443)),
+                    "users": [{
+                        "id": vmess_config.get("id", ""),
+                        "security": vmess_config.get("scy", "aes-128-gcm"),
+                        "alterId": int(vmess_config.get("aid", 0))
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": vmess_config.get("net", "ws"),
+                "security": vmess_config.get("tls", "tls"),
+                "tlsSettings": {
+                    "allowInsecure": bool(vmess_config.get("allowInsecure", 0)),
+                    "disableSystemRoot": False,
+                    "serverName": vmess_config.get("sni", vmess_config.get("host", ""))
+                },
+                "wsSettings": {
+                    "headers": {
+                        "Host": vmess_config.get("host", "")
+                    },
+                    "path": vmess_config.get("path", "/")
+                },
+                "xtlsSettings": {
+                    "disableSystemRoot": False
+                }
+            },
+            "tag": "PROXY"
+        }]
+    }
+
+def read_user_subscription_file(email: str) -> List[str]:
+    """Read user's subscription file from subscribe_local/default/{email}"""
+    try:
+        user_sub_file = f"{V2RAY_AGENT_PATH}/subscribe_local/default/{email}"
+        if os.path.exists(user_sub_file):
+            with open(user_sub_file, 'r') as f:
+                lines = f.readlines()
+            return [line.strip() for line in lines if line.strip()]
+    except Exception as e:
+        logger.warning(f"Failed to read subscription file for {email}: {e}")
+    return []
+
+def parse_config_links_from_subscription(email: str) -> Dict[str, Any]:
+    """Parse configuration links from actual subscription files"""
+    links = {}
+    
+    # Read from subscribe_local/default/{email}
+    subscription_lines = read_user_subscription_file(email)
+    
+    for line in subscription_lines:
+        if line.startswith("vless://"):
+            if "flow=xtls-rprx-vision" in line:
+                links["vless_tcp_vision"] = line
+            elif "type=ws" in line:
+                links["vless_ws"] = line
+            elif "type=grpc" in line:
+                links["vless_grpc"] = line
+            elif "security=reality" in line:
+                if "type=grpc" in line:
+                    links["vless_reality_grpc"] = line
+                else:
+                    links["vless_reality_vision"] = line
+                    
+        elif line.startswith("vmess://"):
+            links["vmess_ws"] = line
+            # Decode VMess and add full config
+            vmess_decoded = decode_vmess_link(line)
+            if vmess_decoded:
+                links["vmess_decoded"] = vmess_decoded
+                links["vmess_v2ray_config"] = convert_vmess_to_v2ray_config(vmess_decoded)
+                
+        elif line.startswith("trojan://"):
+            if "type=grpc" in line:
+                links["trojan_grpc"] = line
+            else:
+                links["trojan_tcp"] = line
+    
+    # Add QR code for the first available link
+    if links:
+        first_link = None
+        for key in ["vless_tcp_vision", "vless_ws", "vmess_ws", "trojan_tcp"]:
+            if key in links:
+                first_link = links[key]
+                break
+        
+        if first_link:
+            import urllib.parse
+            encoded_link = urllib.parse.quote(first_link, safe='')
+            links["qr_code"] = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_link}"
+    
+    return links
+
 def generate_user_config_links(email: str, uuid: str, protocol: str) -> Dict[str, str]:
     """Generate configuration links for a user"""
     domain = get_current_domain()
@@ -289,8 +403,8 @@ async def check_accounts():
                                 email = client.get('email', 'unknown')
                                 uuid = client.get('id', client.get('password', 'unknown'))
                                 
-                                # Generate config links
-                                config_links = generate_user_config_links(email, uuid, protocol)
+                                # Get config links from actual subscription files
+                                config_links = parse_config_links_from_subscription(email)
                                 
                                 users.append(User(
                                     email=email,
@@ -660,6 +774,130 @@ async def delete_user_account(email: str):
             raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
     
     return {"message": f"User {email} deleted successfully"}
+
+@app.get("/accounts/users/{email}/configs", tags=["Account Management"])
+async def get_user_configs(email: str):
+    """Get detailed configuration for a specific user"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Parse config links from subscription files
+    config_links = parse_config_links_from_subscription(email)
+    
+    if not config_links:
+        raise HTTPException(status_code=404, detail=f"No configurations found for user {email}")
+    
+    return {
+        "email": email,
+        "configurations": config_links,
+        "total_configs": len([k for k in config_links.keys() if not k.endswith('_decoded') and k != 'qr_code'])
+    }
+
+@app.get("/accounts/users/{email}/vmess", tags=["Account Management"])
+async def get_user_vmess_config(email: str, format: str = "subscription"):
+    """Get VMess configuration for a user in different formats
+    
+    Args:
+        email: User email
+        format: 'subscription' (base64 link), 'decoded' (JSON), 'v2ray' (full V2Ray config)
+    """
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    config_links = parse_config_links_from_subscription(email)
+    
+    if "vmess_ws" not in config_links:
+        raise HTTPException(status_code=404, detail=f"No VMess configuration found for user {email}")
+    
+    if format == "subscription":
+        return {
+            "email": email,
+            "format": "subscription",
+            "vmess_link": config_links["vmess_ws"]
+        }
+    elif format == "decoded":
+        if "vmess_decoded" not in config_links:
+            raise HTTPException(status_code=404, detail="Failed to decode VMess configuration")
+        return {
+            "email": email,
+            "format": "decoded",
+            "vmess_config": config_links["vmess_decoded"]
+        }
+    elif format == "v2ray":
+        if "vmess_v2ray_config" not in config_links:
+            raise HTTPException(status_code=404, detail="Failed to generate V2Ray configuration")
+        return {
+            "email": email,
+            "format": "v2ray",
+            "v2ray_config": config_links["vmess_v2ray_config"]
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Invalid format. Use 'subscription', 'decoded', or 'v2ray'")
+
+@app.get("/subscriptions/files", tags=["Account Management"])
+async def list_subscription_files():
+    """List all subscription files and their contents"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    subscription_info = {
+        "subscribe_local": {},
+        "subscribe": {},
+        "subscription_types": []
+    }
+    
+    # List subscribe_local files
+    local_default_path = f"{V2RAY_AGENT_PATH}/subscribe_local/default"
+    if os.path.exists(local_default_path):
+        local_files = os.listdir(local_default_path)
+        for file in local_files:
+            file_path = os.path.join(local_default_path, file)
+            if os.path.isfile(file_path):
+                try:
+                    with open(file_path, 'r') as f:
+                        content = f.read().strip()
+                    subscription_info["subscribe_local"][file] = {
+                        "lines": len(content.split('\n')) if content else 0,
+                        "size": len(content),
+                        "preview": content[:200] + "..." if len(content) > 200 else content
+                    }
+                except Exception as e:
+                    subscription_info["subscribe_local"][file] = {"error": str(e)}
+    
+    # List subscribe files (the hashed ones)
+    subscribe_path = f"{V2RAY_AGENT_PATH}/subscribe"
+    if os.path.exists(subscribe_path):
+        for sub_type in os.listdir(subscribe_path):
+            sub_type_path = os.path.join(subscribe_path, sub_type)
+            if os.path.isdir(sub_type_path):
+                subscription_info["subscription_types"].append(sub_type)
+                subscription_info["subscribe"][sub_type] = {}
+                
+                for file in os.listdir(sub_type_path):
+                    file_path = os.path.join(sub_type_path, file)
+                    if os.path.isfile(file_path):
+                        try:
+                            with open(file_path, 'r') as f:
+                                content = f.read().strip()
+                            
+                            # Try to decode if it looks like base64
+                            decoded_content = None
+                            if sub_type == "default":
+                                try:
+                                    import base64
+                                    decoded_content = base64.b64decode(content).decode('utf-8')
+                                except:
+                                    decoded_content = content
+                            
+                            subscription_info["subscribe"][sub_type][file] = {
+                                "size": len(content),
+                                "is_base64": sub_type == "default" and decoded_content != content,
+                                "content": decoded_content if decoded_content else content[:200] + "..." if len(content) > 200 else content
+                            }
+                        except Exception as e:
+                            subscription_info["subscribe"][sub_type][file] = {"error": str(e)}
+    
+    return subscription_info
 
 @app.get("/status", response_model=SystemInfo, tags=["System"])
 async def get_system_status():
