@@ -183,8 +183,16 @@ def decode_vmess_link(vmess_link: str) -> Optional[Dict[str, Any]]:
         logger.warning(f"Failed to decode VMess link: {e}")
     return None
 
-def convert_vmess_to_v2ray_config(vmess_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert VMess subscription format to full V2Ray outbound config"""
+def convert_vmess_to_v2ray_config(vmess_config: Dict[str, Any], custom_sni: Optional[str] = None) -> Dict[str, Any]:
+    """Convert VMess subscription format to full V2Ray outbound config
+    
+    Args:
+        vmess_config: Decoded VMess configuration
+        custom_sni: Custom SNI to override the default serverName
+    """
+    # Use custom SNI if provided, otherwise use the original SNI from config
+    server_name = custom_sni or vmess_config.get("sni", vmess_config.get("host", ""))
+    
     return {
         "outbounds": [{
             "mux": {},
@@ -207,7 +215,7 @@ def convert_vmess_to_v2ray_config(vmess_config: Dict[str, Any]) -> Dict[str, Any
                 "tlsSettings": {
                     "allowInsecure": bool(vmess_config.get("allowInsecure", 0)),
                     "disableSystemRoot": False,
-                    "serverName": vmess_config.get("sni", vmess_config.get("host", ""))
+                    "serverName": server_name
                 },
                 "wsSettings": {
                     "headers": {
@@ -263,6 +271,8 @@ def parse_config_links_from_subscription(email: str) -> Dict[str, Any]:
             if vmess_decoded:
                 links["vmess_decoded"] = vmess_decoded
                 links["vmess_v2ray_config"] = convert_vmess_to_v2ray_config(vmess_decoded)
+                # Store the base config for custom SNI generation
+                links["vmess_base_config"] = vmess_decoded
                 
         elif line.startswith("trojan://"):
             if "type=grpc" in line:
@@ -794,12 +804,13 @@ async def get_user_configs(email: str):
     }
 
 @app.get("/accounts/users/{email}/vmess", tags=["Account Management"])
-async def get_user_vmess_config(email: str, format: str = "subscription"):
+async def get_user_vmess_config(email: str, format: str = "subscription", sni: Optional[str] = None):
     """Get VMess configuration for a user in different formats
     
     Args:
         email: User email
         format: 'subscription' (base64 link), 'decoded' (JSON), 'v2ray' (full V2Ray config)
+        sni: Custom SNI for domain fronting (only affects 'v2ray' format)
     """
     if not check_installation():
         raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
@@ -813,7 +824,8 @@ async def get_user_vmess_config(email: str, format: str = "subscription"):
         return {
             "email": email,
             "format": "subscription",
-            "vmess_link": config_links["vmess_ws"]
+            "vmess_link": config_links["vmess_ws"],
+            "note": "Use format=v2ray with sni parameter for custom SNI"
         }
     elif format == "decoded":
         if "vmess_decoded" not in config_links:
@@ -821,18 +833,108 @@ async def get_user_vmess_config(email: str, format: str = "subscription"):
         return {
             "email": email,
             "format": "decoded",
-            "vmess_config": config_links["vmess_decoded"]
+            "vmess_config": config_links["vmess_decoded"],
+            "note": "Use format=v2ray with sni parameter for custom SNI"
         }
     elif format == "v2ray":
-        if "vmess_v2ray_config" not in config_links:
+        if "vmess_base_config" not in config_links:
             raise HTTPException(status_code=404, detail="Failed to generate V2Ray configuration")
-        return {
+        
+        # Generate config with custom SNI if provided
+        v2ray_config = convert_vmess_to_v2ray_config(config_links["vmess_base_config"], sni)
+        
+        response = {
             "email": email,
             "format": "v2ray",
-            "v2ray_config": config_links["vmess_v2ray_config"]
+            "v2ray_config": v2ray_config
         }
+        
+        # Add SNI information to response
+        if sni:
+            response["custom_sni"] = sni
+            response["note"] = f"Using custom SNI: {sni} for domain fronting"
+        else:
+            original_sni = config_links["vmess_base_config"].get("sni", config_links["vmess_base_config"].get("host", ""))
+            response["original_sni"] = original_sni
+            response["note"] = f"Using original SNI: {original_sni}. Add ?sni=your-domain.com for custom SNI"
+        
+        return response
     else:
         raise HTTPException(status_code=400, detail="Invalid format. Use 'subscription', 'decoded', or 'v2ray'")
+
+@app.post("/accounts/users/{email}/vmess/generate", tags=["Account Management"])
+async def generate_custom_vmess_config(email: str, sni: str, security: Optional[str] = None, allow_insecure: bool = False):
+    """Generate custom VMess V2Ray configuration with specific SNI and settings
+    
+    Args:
+        email: User email
+        sni: Custom SNI for domain fronting (e.g., m.zoom.us)
+        security: Custom security method (default: aes-128-gcm)
+        allow_insecure: Allow insecure connections
+    """
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    config_links = parse_config_links_from_subscription(email)
+    
+    if "vmess_base_config" not in config_links:
+        raise HTTPException(status_code=404, detail=f"No VMess configuration found for user {email}")
+    
+    base_config = config_links["vmess_base_config"]
+    
+    # Create custom configuration
+    custom_config = {
+        "outbounds": [{
+            "mux": {},
+            "protocol": "vmess",
+            "sendThrough": "0.0.0.0",
+            "settings": {
+                "vnext": [{
+                    "address": base_config.get("add", ""),
+                    "port": int(base_config.get("port", 443)),
+                    "users": [{
+                        "id": base_config.get("id", ""),
+                        "security": security or base_config.get("scy", "aes-128-gcm"),
+                        "alterId": int(base_config.get("aid", 0))
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": base_config.get("net", "ws"),
+                "security": base_config.get("tls", "tls"),
+                "tlsSettings": {
+                    "allowInsecure": allow_insecure,
+                    "disableSystemRoot": False,
+                    "serverName": sni  # Custom SNI here
+                },
+                "wsSettings": {
+                    "headers": {
+                        "Host": base_config.get("host", "")
+                    },
+                    "path": base_config.get("path", "/")
+                },
+                "xtlsSettings": {
+                    "disableSystemRoot": False
+                }
+            },
+            "tag": "PROXY"
+        }]
+    }
+    
+    return {
+        "email": email,
+        "custom_config": custom_config,
+        "settings": {
+            "custom_sni": sni,
+            "original_host": base_config.get("host", ""),
+            "security": security or base_config.get("scy", "aes-128-gcm"),
+            "allow_insecure": allow_insecure,
+            "server_address": base_config.get("add", ""),
+            "server_port": int(base_config.get("port", 443)),
+            "websocket_path": base_config.get("path", "/")
+        },
+        "note": "This config uses custom SNI for domain fronting while keeping the original Host header"
+    }
 
 @app.get("/subscriptions/files", tags=["Account Management"])
 async def list_subscription_files():
