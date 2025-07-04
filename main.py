@@ -83,16 +83,23 @@ class CustomVMessResponse(BaseModel):
     settings: Dict[str, Any]
     note: str
 
+class ConfigFileInfo(BaseModel):
+    filename: str
+    size: int
+    exists: bool
+    is_vmess: bool
+    client_count: Optional[int] = None
+
+class ConfigFilesResponse(BaseModel):
+    config_path: str
+    total_files: int
+    json_files: List[ConfigFileInfo]
+    vmess_files: List[str]
+
 class PopularSNIResponse(BaseModel):
     popular_sni_domains: Dict[str, List[str]]
     note: str
     usage: str
-
-class SystemInfo(BaseModel):
-    installed_protocols: List[str]
-    version: str
-    config_path: str
-    vmess_enabled: bool
 
 # Utility Functions
 async def run_shell_command(command: str, timeout: int = 30) -> Dict[str, Any]:
@@ -345,21 +352,123 @@ async def get_services_status():
     
     return service_statuses
 
+class SystemInfo(BaseModel):
+    installed_protocols: List[str]
+    version: str
+    config_path: str
+    vmess_enabled: bool
+
 # VMess Management API Routes
 
+@app.get("/config/files", response_model=ConfigFilesResponse, tags=["Configuration"])
+async def list_config_files():
+    """List all JSON configuration files in the config directory"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    if not os.path.exists(CONFIG_PATH):
+        raise HTTPException(status_code=404, detail=f"Configuration path {CONFIG_PATH} not found")
+    
+    json_files = []
+    vmess_files = []
+    
+    try:
+        for filename in os.listdir(CONFIG_PATH):
+            if filename.endswith('.json'):
+                file_path = os.path.join(CONFIG_PATH, filename)
+                file_size = os.path.getsize(file_path)
+                
+                # Check if this is a VMess config by reading the file
+                is_vmess = False
+                client_count = None
+                
+                try:
+                    with open(file_path, 'r') as f:
+                        config = json.load(f)
+                    
+                    # Check if it's a VMess configuration
+                    if 'inbounds' in config:
+                        for inbound in config['inbounds']:
+                            if ('protocol' in inbound and inbound['protocol'] == 'vmess') or \
+                               ('settings' in inbound and 'clients' in inbound['settings']):
+                                is_vmess = True
+                                if 'settings' in inbound and 'clients' in inbound['settings']:
+                                    client_count = len(inbound['settings']['clients'])
+                                    vmess_files.append(filename)
+                                break
+                                
+                except Exception as e:
+                    logger.warning(f"Failed to parse {filename}: {e}")
+                
+                json_files.append(ConfigFileInfo(
+                    filename=filename,
+                    size=file_size,
+                    exists=True,
+                    is_vmess=is_vmess,
+                    client_count=client_count
+                ))
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read config directory: {str(e)}")
+    
+    # Sort files by name
+    json_files.sort(key=lambda x: x.filename)
+    
+    return ConfigFilesResponse(
+        config_path=CONFIG_PATH,
+        total_files=len(json_files),
+        json_files=json_files,
+        vmess_files=sorted(vmess_files)
+    )
+
 @app.get("/vmess/users", response_model=VMessUsersResponse, tags=["VMess Management"])
-async def get_vmess_users():
-    """Get all users with VMess configurations"""
+async def get_vmess_users(
+    config_file: Optional[str] = Query(None, description="Specific config file to read (e.g., '03_VMess_WS_inbounds.json')")
+):
+    """Get all users with VMess configurations
+    
+    Args:
+        config_file: Optional specific config file to read. If not provided, will auto-detect VMess files.
+    """
     if not check_installation():
         raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
     
     vmess_users = []
     
-    # Parse VMess config file for users
-    config_file = f"{CONFIG_PATH}/03_VMess_WS_inbounds.json"
-    if os.path.exists(config_file):
+    # If specific config file is provided, use it
+    if config_file:
+        config_file_path = f"{CONFIG_PATH}/{config_file}"
+        if not os.path.exists(config_file_path):
+            raise HTTPException(status_code=404, detail=f"Config file {config_file} not found")
+        
+        config_files_to_check = [config_file_path]
+    else:
+        # Auto-detect VMess config files
+        config_files_to_check = []
         try:
-            with open(config_file, 'r') as f:
+            for filename in os.listdir(CONFIG_PATH):
+                if filename.endswith('.json'):
+                    file_path = os.path.join(CONFIG_PATH, filename)
+                    try:
+                        with open(file_path, 'r') as f:
+                            config = json.load(f)
+                        
+                        # Check if it's a VMess configuration
+                        if 'inbounds' in config:
+                            for inbound in config['inbounds']:
+                                if ('protocol' in inbound and inbound['protocol'] == 'vmess') or \
+                                   ('settings' in inbound and 'clients' in inbound['settings']):
+                                    config_files_to_check.append(file_path)
+                                    break
+                    except Exception:
+                        continue
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to scan config files: {str(e)}")
+    
+    # Parse VMess config files for users
+    for config_file_path in config_files_to_check:
+        try:
+            with open(config_file_path, 'r') as f:
                 config = json.load(f)
             
             if 'inbounds' in config:
@@ -380,7 +489,7 @@ async def get_vmess_users():
                             ))
                             
         except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"Failed to parse VMess config: {e}")
+            logger.warning(f"Failed to parse VMess config {config_file_path}: {e}")
     
     return VMessUsersResponse(
         total_vmess_users=len(vmess_users),
