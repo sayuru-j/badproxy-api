@@ -59,6 +59,7 @@ class User(BaseModel):
     uuid: str
     protocol: ProtocolType
     created_at: Optional[datetime] = None
+    config_links: Optional[Dict[str, str]] = None
 
 class AddUserRequest(BaseModel):
     email: str
@@ -80,6 +81,24 @@ class SystemInfo(BaseModel):
     config_path: str
     log_status: bool
     certificate_info: Optional[CertificateInfo] = None
+
+class SubscriptionInfo(BaseModel):
+    email: str
+    default_subscription: Optional[str] = None
+    clash_meta_subscription: Optional[str] = None
+    qr_code_url: Optional[str] = None
+    subscription_url: Optional[str] = None
+
+class AddSubscriptionRequest(BaseModel):
+    domain: str
+    port: int
+    alias: str
+
+class AccountSummary(BaseModel):
+    total_users: int
+    protocols: Dict[str, int]
+    subscription_enabled: bool
+    users: List[User]
 
 # Utility Functions
 async def run_shell_command(command: str, timeout: int = 30) -> Dict[str, Any]:
@@ -117,6 +136,79 @@ def check_installation() -> bool:
     """Check if v2ray-agent is installed"""
     return os.path.exists(V2RAY_AGENT_PATH) and os.path.exists(INSTALL_SCRIPT_PATH)
 
+def get_subscription_salt() -> str:
+    """Get or create subscription salt"""
+    salt_file = f"{V2RAY_AGENT_PATH}/subscribe_local/subscribeSalt"
+    try:
+        if os.path.exists(salt_file):
+            with open(salt_file, 'r') as f:
+                return f.read().strip()
+        else:
+            # Generate random salt
+            import secrets
+            import string
+            salt = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+            os.makedirs(os.path.dirname(salt_file), exist_ok=True)
+            with open(salt_file, 'w') as f:
+                f.write(salt)
+            return salt
+    except Exception:
+        return "defaultsalt123"
+
+def get_current_domain() -> str:
+    """Get current domain from nginx config"""
+    try:
+        nginx_conf_path = "/etc/nginx/conf.d/alone.conf"
+        if os.path.exists(nginx_conf_path):
+            with open(nginx_conf_path, 'r') as f:
+                content = f.read()
+                # Extract server_name
+                import re
+                match = re.search(r'server_name\s+([^;]+);', content)
+                if match:
+                    return match.group(1).strip()
+    except Exception:
+        pass
+    return "localhost"
+
+def generate_user_config_links(email: str, uuid: str, protocol: str) -> Dict[str, str]:
+    """Generate configuration links for a user"""
+    domain = get_current_domain()
+    salt = get_subscription_salt()
+    
+    # Generate MD5 hash for subscription
+    import hashlib
+    email_hash = hashlib.md5(f"{email}{salt}".encode()).hexdigest()
+    
+    links = {}
+    
+    if protocol == "vless":
+        # VLESS TCP TLS
+        vless_link = f"vless://{uuid}@{domain}:443?encryption=none&security=tls&type=tcp&host={domain}&fp=chrome&headerType=none&sni={domain}&flow=xtls-rprx-vision#{email}"
+        links["vless_tcp"] = vless_link
+        
+        # VLESS WS TLS  
+        vless_ws_link = f"vless://{uuid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&sni={domain}&fp=chrome&path=/ws#{email}"
+        links["vless_ws"] = vless_ws_link
+        
+    elif protocol == "vmess":
+        # VMess WS TLS
+        vmess_link = f"vmess://{uuid}@{domain}:443?encryption=none&security=tls&type=ws&host={domain}&path=/ws#{email}"
+        links["vmess_ws"] = vmess_link
+        
+    elif protocol == "trojan":
+        # Trojan TCP TLS
+        trojan_link = f"trojan://{uuid}@{domain}:443?encryption=none&security=tls&type=tcp&host={domain}&headerType=none&sni={domain}#{email}"
+        links["trojan_tcp"] = trojan_link
+    
+    # QR Code URL
+    if links:
+        first_link = list(links.values())[0]
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={first_link.replace(':', '%3A').replace('/', '%2F').replace('?', '%3F').replace('&', '%26').replace('=', '%3D').replace('#', '%23')}"
+        links["qr_code"] = qr_url
+    
+    return links
+
 def get_service_status(service: str) -> ServiceStatus:
     """Get status of a systemd service"""
     try:
@@ -143,6 +235,407 @@ async def root():
         "status": "running",
         "timestamp": datetime.now().isoformat()
     }
+async def check_accounts():
+    """1. Check account - Get comprehensive account information"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    users = []
+    protocol_counts = {"vless": 0, "vmess": 0, "trojan": 0, "hysteria": 0, "reality": 0, "tuic": 0}
+    
+    # Parse Xray config files for users
+    config_files = [
+        ("02_VLESS_TCP_inbounds.json", "vless"),
+        ("03_VMess_WS_inbounds.json", "vmess"),
+        ("04_trojan_TCP_inbounds.json", "trojan"),
+        ("07_VLESS_vision_reality_inbounds.json", "reality")
+    ]
+    
+    for config_file, protocol in config_files:
+        config_path_full = f"{CONFIG_PATH}/{config_file}"
+        if os.path.exists(config_path_full):
+            try:
+                with open(config_path_full, 'r') as f:
+                    config = json.load(f)
+                
+                if 'inbounds' in config:
+                    for inbound in config['inbounds']:
+                        if 'settings' in inbound and 'clients' in inbound['settings']:
+                            for client in inbound['settings']['clients']:
+                                email = client.get('email', 'unknown')
+                                uuid = client.get('id', client.get('password', 'unknown'))
+                                
+                                # Generate config links
+                                config_links = generate_user_config_links(email, uuid, protocol)
+                                
+                                users.append(User(
+                                    email=email,
+                                    uuid=uuid,
+                                    protocol=protocol,
+                                    config_links=config_links
+                                ))
+                                protocol_counts[protocol] += 1
+                                
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"Failed to parse {config_file}: {e}")
+    
+    # Check Hysteria users
+    hysteria_config = "/etc/v2ray-agent/hysteria/conf.json"
+    if os.path.exists(hysteria_config):
+        try:
+            with open(hysteria_config, 'r') as f:
+                config = json.load(f)
+            if 'auth' in config and 'config' in config['auth']:
+                for auth_key in config['auth']['config']:
+                    users.append(User(
+                        email=f"hysteria_user_{auth_key[:8]}",
+                        uuid=auth_key,
+                        protocol="hysteria"
+                    ))
+                    protocol_counts["hysteria"] += 1
+        except Exception as e:
+            logger.warning(f"Failed to parse Hysteria config: {e}")
+    
+    # Check if subscription is enabled
+    subscription_enabled = os.path.exists(f"{V2RAY_AGENT_PATH}/subscribe_local/subscribeSalt")
+    
+    return AccountSummary(
+        total_users=len(users),
+        protocols=protocol_counts,
+        subscription_enabled=subscription_enabled,
+        users=users
+    )
+
+@app.get("/subscriptions", response_model=List[SubscriptionInfo], tags=["Account Management"])  
+async def view_subscriptions():
+    """2. View subscription - Get subscription links for all users"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    subscriptions = []
+    salt = get_subscription_salt()
+    domain = get_current_domain()
+    
+    # Get all users first
+    accounts = await check_accounts()
+    
+    for user in accounts.users:
+        import hashlib
+        email_hash = hashlib.md5(f"{user.email}{salt}".encode()).hexdigest()
+        
+        subscription_info = SubscriptionInfo(
+            email=user.email,
+            subscription_url=f"https://{domain}/s/default/{email_hash}",
+            qr_code_url=f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=https%3A%2F%2F{domain}%2Fs%2Fdefault%2F{email_hash}"
+        )
+        
+        # Check if subscription files exist
+        default_sub_file = f"{V2RAY_AGENT_PATH}/subscribe/default/{email_hash}"
+        clash_sub_file = f"{V2RAY_AGENT_PATH}/subscribe/clashMeta/{email_hash}"
+        
+        if os.path.exists(default_sub_file):
+            subscription_info.default_subscription = f"https://{domain}/s/default/{email_hash}"
+            
+        if os.path.exists(clash_sub_file):
+            subscription_info.clash_meta_subscription = f"https://{domain}/s/clashMeta/{email_hash}"
+        
+        subscriptions.append(subscription_info)
+    
+    return subscriptions
+
+@app.post("/subscriptions/generate", tags=["Account Management"])
+async def generate_subscriptions():
+    """Generate/Regenerate subscription files for all users"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Use the v2ray-agent script to generate subscriptions
+    command = f"echo '2' | {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=60)
+    
+    if not result["success"]:
+        # If script method fails, try to generate manually
+        try:
+            salt = get_subscription_salt()
+            os.makedirs(f"{V2RAY_AGENT_PATH}/subscribe/default", exist_ok=True)
+            os.makedirs(f"{V2RAY_AGENT_PATH}/subscribe/clashMeta", exist_ok=True)
+            
+            accounts = await check_accounts()
+            for user in accounts.users:
+                import hashlib
+                email_hash = hashlib.md5(f"{user.email}{salt}".encode()).hexdigest()
+                
+                # Generate subscription content
+                if user.config_links:
+                    # Create default subscription (base64 encoded URLs)
+                    links = [link for key, link in user.config_links.items() if key != "qr_code"]
+                    if links:
+                        import base64
+                        content = "\n".join(links)
+                        encoded_content = base64.b64encode(content.encode()).decode()
+                        
+                        with open(f"{V2RAY_AGENT_PATH}/subscribe/default/{email_hash}", 'w') as f:
+                            f.write(encoded_content)
+            
+            return {"message": "Subscriptions generated successfully (manual method)"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate subscriptions: {str(e)}")
+    
+    return {"message": "Subscriptions generated successfully"}
+
+@app.post("/subscriptions/remote", tags=["Account Management"])
+async def add_remote_subscription(request: AddSubscriptionRequest):
+    """3. Add subscription - Add remote machine subscription"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Format: domain:port:alias
+    remote_url = f"{request.domain}:{request.port}:{request.alias}"
+    
+    # Add to remote subscription file
+    remote_sub_file = f"{V2RAY_AGENT_PATH}/subscribe_remote/remoteSubscribeUrl"
+    os.makedirs(os.path.dirname(remote_sub_file), exist_ok=True)
+    
+    try:
+        with open(remote_sub_file, 'a') as f:
+            f.write(f"{remote_url}\n")
+        
+        return {
+            "message": f"Remote subscription added successfully: {request.alias}",
+            "remote_url": remote_url
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add remote subscription: {str(e)}")
+
+@app.get("/subscriptions/remote", tags=["Account Management"])
+async def get_remote_subscriptions():
+    """Get list of remote subscriptions"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    remote_sub_file = f"{V2RAY_AGENT_PATH}/subscribe_remote/remoteSubscribeUrl"
+    
+    if not os.path.exists(remote_sub_file):
+        return {"remote_subscriptions": []}
+    
+    try:
+        with open(remote_sub_file, 'r') as f:
+            lines = f.readlines()
+        
+        remote_subs = []
+        for line in lines:
+            line = line.strip()
+            if line and ':' in line:
+                parts = line.split(':')
+                if len(parts) >= 3:
+                    remote_subs.append({
+                        "domain": parts[0],
+                        "port": parts[1],
+                        "alias": parts[2],
+                        "full_url": line
+                    })
+        
+        return {"remote_subscriptions": remote_subs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read remote subscriptions: {str(e)}")
+
+@app.delete("/subscriptions/remote/{alias}", tags=["Account Management"])
+async def remove_remote_subscription(alias: str):
+    """Remove remote subscription by alias"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    remote_sub_file = f"{V2RAY_AGENT_PATH}/subscribe_remote/remoteSubscribeUrl"
+    
+    if not os.path.exists(remote_sub_file):
+        raise HTTPException(status_code=404, detail="No remote subscriptions found")
+    
+    try:
+        with open(remote_sub_file, 'r') as f:
+            lines = f.readlines()
+        
+        new_lines = []
+        removed = False
+        for line in lines:
+            if not line.strip().endswith(f":{alias}"):
+                new_lines.append(line)
+            else:
+                removed = True
+        
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Remote subscription with alias '{alias}' not found")
+        
+        with open(remote_sub_file, 'w') as f:
+            f.writelines(new_lines)
+        
+        return {"message": f"Remote subscription '{alias}' removed successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to remove remote subscription: {str(e)}")
+
+@app.post("/accounts/users", tags=["Account Management"])
+async def add_user_account(user_request: AddUserRequest):
+    """4. Add user - Add a new user account"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Generate UUID if not provided
+    if not user_request.uuid:
+        import uuid
+        user_request.uuid = str(uuid.uuid4())
+    
+    # Use the v2ray-agent script to add user
+    # Format: 7 (account management) -> 4 (add user) -> email -> uuid
+    command = f"echo '7\n4\n{user_request.email}\n{user_request.uuid}\n' | timeout 60 {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=90)
+    
+    if not result["success"]:
+        # Try alternative method by directly modifying config files
+        try:
+            # Find the appropriate config file based on protocol
+            protocol_files = {
+                "vless": "02_VLESS_TCP_inbounds.json",
+                "vmess": "03_VMess_WS_inbounds.json", 
+                "trojan": "04_trojan_TCP_inbounds.json"
+            }
+            
+            if user_request.protocol.value in protocol_files:
+                config_file = f"{CONFIG_PATH}/{protocol_files[user_request.protocol.value]}"
+                
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                    
+                    # Add new user to clients array
+                    new_client = {
+                        "id" if user_request.protocol.value != "trojan" else "password": user_request.uuid,
+                        "email": user_request.email
+                    }
+                    
+                    if user_request.protocol.value == "vless":
+                        new_client["flow"] = "xtls-rprx-vision"
+                    elif user_request.protocol.value == "vmess":
+                        new_client["alterId"] = 0
+                    
+                    config['inbounds'][0]['settings']['clients'].append(new_client)
+                    
+                    # Write back to file
+                    with open(config_file, 'w') as f:
+                        json.dump(config, f, indent=2)
+                    
+                    # Reload core
+                    reload_result = await run_shell_command("systemctl reload xray")
+                    
+                    # Generate config links
+                    config_links = generate_user_config_links(user_request.email, user_request.uuid, user_request.protocol.value)
+                    
+                    return {
+                        "message": "User added successfully",
+                        "email": user_request.email,
+                        "uuid": user_request.uuid,
+                        "protocol": user_request.protocol,
+                        "config_links": config_links,
+                        "reload_status": "success" if reload_result["success"] else "failed"
+                    }
+                else:
+                    raise HTTPException(status_code=400, detail=f"Protocol {user_request.protocol.value} is not installed")
+            else:
+                raise HTTPException(status_code=400, detail=f"Protocol {user_request.protocol.value} is not supported for direct addition")
+                
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to add user: {str(e)}")
+    
+    # Generate config links for successful addition
+    config_links = generate_user_config_links(user_request.email, user_request.uuid, user_request.protocol.value)
+    
+    return {
+        "message": "User added successfully",
+        "email": user_request.email,
+        "uuid": user_request.uuid,
+        "protocol": user_request.protocol,
+        "config_links": config_links
+    }
+
+@app.delete("/accounts/users/{email}", tags=["Account Management"])
+async def delete_user_account(email: str):
+    """5. Delete user - Remove user account"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Use the v2ray-agent script to delete user
+    # Format: 7 (account management) -> 5 (delete user) -> email
+    command = f"echo '7\n5\n{email}\n' | timeout 60 {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=90)
+    
+    if not result["success"]:
+        # Try alternative method by directly modifying config files
+        try:
+            deleted = False
+            config_files = [
+                "02_VLESS_TCP_inbounds.json",
+                "03_VMess_WS_inbounds.json",
+                "04_trojan_TCP_inbounds.json",
+                "07_VLESS_vision_reality_inbounds.json"
+            ]
+            
+            for config_file in config_files:
+                config_path_full = f"{CONFIG_PATH}/{config_file}"
+                if os.path.exists(config_path_full):
+                    with open(config_path_full, 'r') as f:
+                        config = json.load(f)
+                    
+                    if 'inbounds' in config:
+                        for inbound in config['inbounds']:
+                            if 'settings' in inbound and 'clients' in inbound['settings']:
+                                clients = inbound['settings']['clients']
+                                original_length = len(clients)
+                                
+                                # Remove clients with matching email
+                                inbound['settings']['clients'] = [
+                                    client for client in clients 
+                                    if client.get('email') != email
+                                ]
+                                
+                                if len(inbound['settings']['clients']) < original_length:
+                                    deleted = True
+                                    
+                                    # Write back to file
+                                    with open(config_path_full, 'w') as f:
+                                        json.dump(config, f, indent=2)
+            
+            if deleted:
+                # Reload core
+                reload_result = await run_shell_command("systemctl reload xray")
+                
+                # Clean up subscription files
+                salt = get_subscription_salt()
+                import hashlib
+                email_hash = hashlib.md5(f"{email}{salt}".encode()).hexdigest()
+                
+                sub_files = [
+                    f"{V2RAY_AGENT_PATH}/subscribe/default/{email_hash}",
+                    f"{V2RAY_AGENT_PATH}/subscribe/clashMeta/{email_hash}",
+                    f"{V2RAY_AGENT_PATH}/subscribe_local/default/{email}",
+                    f"{V2RAY_AGENT_PATH}/subscribe_local/clashMeta/{email}"
+                ]
+                
+                for sub_file in sub_files:
+                    if os.path.exists(sub_file):
+                        os.remove(sub_file)
+                
+                return {
+                    "message": f"User {email} deleted successfully",
+                    "reload_status": "success" if reload_result["success"] else "failed"
+                }
+            else:
+                raise HTTPException(status_code=404, detail=f"User {email} not found")
+                
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete user: {str(e)}")
+    
+    return {"message": f"User {email} deleted successfully"}
 
 @app.get("/status", response_model=SystemInfo, tags=["System"])
 async def get_system_status():
