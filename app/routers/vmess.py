@@ -1,21 +1,24 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional
 
 from app.models.vmess import (
     VMessUsersResponse, VMessConfigResponse, CustomVMessRequest, 
     CustomVMessResponse, PopularSNIResponse
 )
+from app.models.auth import UserResponse
 from app.services.system import system_service
 from app.services.v2ray import v2ray_service
 from app.services.vmess import vmess_service
 from app.utils.constants import ConfigFormat
 from app.config import settings
+from app.auth.dependencies import get_current_active_user
 
 router = APIRouter()
 
 @router.get("/users", response_model=VMessUsersResponse)
 async def get_vmess_users(
-    config_file: Optional[str] = Query(None, description="Specific config file to read (e.g., '03_VMess_WS_inbounds.json')")
+    config_file: Optional[str] = Query(None, description="Specific config file to read (e.g., '03_VMess_WS_inbounds.json')"),
+    current_user: UserResponse = Depends(get_current_active_user)
 ):
     """Get all users with VMess configurations
     
@@ -51,7 +54,8 @@ async def get_vmess_users(
 async def get_user_vmess_config(
     email: str,
     format: ConfigFormat = Query(ConfigFormat.v2ray, description="Output format"),
-    sni: Optional[str] = Query(None, description="Custom SNI for domain fronting (e.g., m.zoom.us)")
+    sni: Optional[str] = Query(None, description="Custom SNI for domain fronting (e.g., m.zoom.us)"),
+    current_user: UserResponse = Depends(get_current_active_user)
 ):
     """Get VMess configuration for a user
     
@@ -104,7 +108,11 @@ async def get_user_vmess_config(
         return response
 
 @router.post("/users/{email}/generate", response_model=CustomVMessResponse)
-async def generate_custom_vmess_config(email: str, request: CustomVMessRequest):
+async def generate_custom_vmess_config(
+    email: str, 
+    request: CustomVMessRequest,
+    current_user: UserResponse = Depends(get_current_active_user)
+):
     """Generate custom VMess V2Ray configuration with specific SNI
     
     Args:
@@ -177,7 +185,7 @@ async def generate_custom_vmess_config(email: str, request: CustomVMessRequest):
 
 @router.get("/popular-sni", response_model=PopularSNIResponse)
 async def get_popular_sni_domains():
-    """Get list of popular SNI domains for domain fronting"""
+    """Get list of popular SNI domains for domain fronting (public endpoint)"""
     popular_domains = vmess_service.get_popular_sni_domains()
     
     return PopularSNIResponse(

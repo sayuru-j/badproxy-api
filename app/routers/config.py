@@ -1,14 +1,16 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 
 from app.models.system import ConfigFilesResponse
+from app.models.auth import UserResponse
 from app.services.system import system_service
 from app.services.v2ray import v2ray_service
 from app.config import settings
+from app.auth.dependencies import get_current_active_user
 
 router = APIRouter()
 
 @router.get("/files", response_model=ConfigFilesResponse)
-async def list_config_files():
+async def list_config_files(current_user: UserResponse = Depends(get_current_active_user)):
     """List all JSON configuration files in the config directory"""
     if not system_service.check_v2ray_installation():
         raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
