@@ -213,7 +213,7 @@ def convert_vmess_to_v2ray_config(vmess_config: Dict[str, Any], custom_sni: Opti
                 "network": vmess_config.get("net", "ws"),
                 "security": vmess_config.get("tls", "tls"),
                 "tlsSettings": {
-                    "allowInsecure": bool(vmess_config.get("allowInsecure", 0)),
+                    "allowInsecure": True,
                     "disableSystemRoot": False,
                     "serverName": server_name
                 },
@@ -243,57 +243,20 @@ def read_user_subscription_file(email: str) -> List[str]:
         logger.warning(f"Failed to read subscription file for {email}: {e}")
     return []
 
-def parse_config_links_from_subscription(email: str) -> Dict[str, Any]:
-    """Parse configuration links from actual subscription files"""
-    links = {}
-    
-    # Read from subscribe_local/default/{email}
+def parse_vmess_from_subscription(email: str) -> Optional[Dict[str, Any]]:
+    """Parse VMess configuration from subscription files"""
     subscription_lines = read_user_subscription_file(email)
     
     for line in subscription_lines:
-        if line.startswith("vless://"):
-            if "flow=xtls-rprx-vision" in line:
-                links["vless_tcp_vision"] = line
-            elif "type=ws" in line:
-                links["vless_ws"] = line
-            elif "type=grpc" in line:
-                links["vless_grpc"] = line
-            elif "security=reality" in line:
-                if "type=grpc" in line:
-                    links["vless_reality_grpc"] = line
-                else:
-                    links["vless_reality_vision"] = line
-                    
-        elif line.startswith("vmess://"):
-            links["vmess_ws"] = line
-            # Decode VMess and add full config
+        if line.startswith("vmess://"):
             vmess_decoded = decode_vmess_link(line)
             if vmess_decoded:
-                links["vmess_decoded"] = vmess_decoded
-                links["vmess_v2ray_config"] = convert_vmess_to_v2ray_config(vmess_decoded)
-                # Store the base config for custom SNI generation
-                links["vmess_base_config"] = vmess_decoded
-                
-        elif line.startswith("trojan://"):
-            if "type=grpc" in line:
-                links["trojan_grpc"] = line
-            else:
-                links["trojan_tcp"] = line
-    
-    # Add QR code for the first available link
-    if links:
-        first_link = None
-        for key in ["vless_tcp_vision", "vless_ws", "vmess_ws", "trojan_tcp"]:
-            if key in links:
-                first_link = links[key]
-                break
-        
-        if first_link:
-            import urllib.parse
-            encoded_link = urllib.parse.quote(first_link, safe='')
-            links["qr_code"] = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_link}"
-    
-    return links
+                return {
+                    "vmess_link": line,
+                    "vmess_decoded": vmess_decoded,
+                    "vmess_base_config": vmess_decoded
+                }
+    return None
 
 def generate_user_config_links(email: str, uuid: str, protocol: str) -> Dict[str, str]:
     """Generate configuration links for a user"""
