@@ -1,12 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 python-multipart
 aiofiles
-python-jose[cryptography]
-passlib[bcrypt]
-python-dotenv
-jq
-asyncio
-email-validator
-pydantic-settings

@@ -1,285 +1,416 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-import uvicorn
-import os
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import asyncio
-import json
 import subprocess
-from datetime import datetime
+import json
+import os
 import logging
-from contextlib import asynccontextmanager
+from datetime import datetime
+from enum import Enum
 
-from app.models import *
-from app.services.script_wrapper import V2RayAgentWrapper
-from app.services.config_parser import ConfigParser
-from app.core.config import settings
-from app.core.logger import setup_logger
-
-# Setup logging
-logger = setup_logger()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting V2Ray-Agent FastAPI Wrapper")
-    # Check if original script exists
-    if not os.path.exists(settings.V2RAY_SCRIPT_PATH):
-        logger.error(f"V2Ray-Agent script not found at {settings.V2RAY_SCRIPT_PATH}")
-    yield
-    # Shutdown
-    logger.info("Shutting down V2Ray-Agent FastAPI Wrapper")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="V2Ray-Agent Management API",
-    description="FastAPI wrapper for v2ray-agent terminal script",
-    version="1.0.0",
-    lifespan=lifespan
+    title="V2Ray Agent Management API",
+    description="FastAPI for managing v2ray-agent installation and configurations",
+    version="1.0.0"
 )
 
-# CORS middleware
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize services
-script_wrapper = V2RayAgentWrapper()
-config_parser = ConfigParser()
-security = HTTPBearer()
+# Constants
+V2RAY_AGENT_PATH = "/etc/v2ray-agent"
+INSTALL_SCRIPT_PATH = f"{V2RAY_AGENT_PATH}/install.sh"
+CONFIG_PATH = f"{V2RAY_AGENT_PATH}/xray/conf"
 
-# Health check
-@app.get("/health")
-async def health_check():
+# Enums
+class ServiceStatus(str, Enum):
+    running = "running"
+    stopped = "stopped"
+    unknown = "unknown"
+
+class ProtocolType(str, Enum):
+    vless = "vless"
+    vmess = "vmess"
+    trojan = "trojan"
+    hysteria = "hysteria"
+    reality = "reality"
+    tuic = "tuic"
+
+# Pydantic Models
+class ServiceStatusResponse(BaseModel):
+    service: str
+    status: ServiceStatus
+    pid: Optional[int] = None
+    uptime: Optional[str] = None
+
+class User(BaseModel):
+    email: str
+    uuid: str
+    protocol: ProtocolType
+    created_at: Optional[datetime] = None
+
+class AddUserRequest(BaseModel):
+    email: str
+    uuid: Optional[str] = None
+    protocol: ProtocolType = ProtocolType.vless
+
+class ServiceControlRequest(BaseModel):
+    action: str = Field(..., pattern="^(start|stop|restart)$")
+
+class CertificateInfo(BaseModel):
+    domain: str
+    expiry_date: Optional[str] = None
+    issuer: Optional[str] = None
+    status: str
+
+class SystemInfo(BaseModel):
+    installed_protocols: List[str]
+    version: str
+    config_path: str
+    log_status: bool
+    certificate_info: Optional[CertificateInfo] = None
+
+# Utility Functions
+async def run_shell_command(command: str, timeout: int = 30) -> Dict[str, Any]:
+    """Execute shell command and return result"""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Command timed out",
+            "returncode": -1
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": str(e),
+            "returncode": -1
+        }
+
+def check_installation() -> bool:
+    """Check if v2ray-agent is installed"""
+    return os.path.exists(V2RAY_AGENT_PATH) and os.path.exists(INSTALL_SCRIPT_PATH)
+
+def get_service_status(service: str) -> ServiceStatus:
+    """Get status of a systemd service"""
+    try:
+        result = subprocess.run(
+            f"systemctl is-active {service}",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and result.stdout.strip() == "active":
+            return ServiceStatus.running
+        else:
+            return ServiceStatus.stopped
+    except:
+        return ServiceStatus.unknown
+
+# API Routes
+
+@app.get("/", tags=["Health"])
+async def root():
     """Health check endpoint"""
     return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "script_available": os.path.exists(settings.V2RAY_SCRIPT_PATH)
+        "message": "V2Ray Agent Management API",
+        "status": "running",
+        "timestamp": datetime.now().isoformat()
     }
 
-# System Information
-@app.get("/api/system/status", response_model=SystemStatus)
+@app.get("/status", response_model=SystemInfo, tags=["System"])
 async def get_system_status():
-    """Get system and v2ray-agent status"""
-    try:
-        status = await script_wrapper.get_system_status()
-        return status
-    except Exception as e:
-        logger.error(f"Error getting system status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get overall system status and information"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Get installed protocols
+    installed_protocols = []
+    config_files = {
+        "vless": "02_VLESS_TCP_inbounds.json",
+        "vmess": "03_VMess_WS_inbounds.json", 
+        "trojan": "04_trojan_TCP_inbounds.json",
+        "hysteria": "/etc/v2ray-agent/hysteria/conf.json",
+        "reality": "07_VLESS_vision_reality_inbounds.json"
+    }
+    
+    for protocol, config_file in config_files.items():
+        if protocol == "hysteria":
+            if os.path.exists(config_file):
+                installed_protocols.append(protocol)
+        else:
+            if os.path.exists(f"{CONFIG_PATH}/{config_file}"):
+                installed_protocols.append(protocol)
+    
+    # Get version
+    version_result = await run_shell_command(f"grep 'Current version:' {INSTALL_SCRIPT_PATH} | head -1")
+    version = "unknown"
+    if version_result["success"] and version_result["stdout"]:
+        version = version_result["stdout"].split(":")[-1].strip().replace('"', '')
+    
+    return SystemInfo(
+        installed_protocols=installed_protocols,
+        version=version,
+        config_path=CONFIG_PATH,
+        log_status=os.path.exists(f"{V2RAY_AGENT_PATH}/access.log"),
+        certificate_info=None  # TODO: Implement certificate parsing
+    )
 
-@app.get("/api/system/install-status", response_model=InstallStatus)
-async def get_install_status():
-    """Get installation status of various components"""
-    try:
-        status = await script_wrapper.get_install_status()
-        return status
-    except Exception as e:
-        logger.error(f"Error getting install status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Protocol Management
-@app.post("/api/protocols/install", response_model=InstallResponse)
-async def install_protocol(request: InstallRequest, background_tasks: BackgroundTasks):
-    """Install protocols using original script"""
-    try:
-        # Add installation task to background
-        background_tasks.add_task(script_wrapper.install_protocol, request)
-        
-        return InstallResponse(
-            message="Installation started",
-            task_id=f"install_{request.protocols}_{datetime.now().timestamp()}",
-            status="started"
+@app.get("/services", response_model=List[ServiceStatusResponse], tags=["Services"])
+async def get_services_status():
+    """Get status of all v2ray-agent related services"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    services = ["xray", "v2ray", "hysteria", "tuic"]
+    service_statuses = []
+    
+    for service in services:
+        status = get_service_status(service)
+        service_info = ServiceStatusResponse(
+            service=service,
+            status=status
         )
-    except Exception as e:
-        logger.error(f"Error starting installation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        
+        # Get PID if running
+        if status == ServiceStatus.running:
+            pid_result = await run_shell_command(f"systemctl show {service} --property=MainPID --value")
+            if pid_result["success"] and pid_result["stdout"].strip():
+                try:
+                    service_info.pid = int(pid_result["stdout"].strip())
+                except ValueError:
+                    pass
+        
+        service_statuses.append(service_info)
+    
+    return service_statuses
 
-@app.get("/api/protocols/supported", response_model=List[ProtocolInfo])
-async def get_supported_protocols():
-    """Get list of supported protocols"""
-    return [
-        ProtocolInfo(name="vless_tcp_tls", description="VLESS+TCP+TLS", port_required=True),
-        ProtocolInfo(name="vless_tcp_xtls", description="VLESS+TCP+XTLS", port_required=True),
-        ProtocolInfo(name="vless_grpc_tls", description="VLESS+gRPC+TLS", port_required=True),
-        ProtocolInfo(name="vless_ws_tls", description="VLESS+WS+TLS", port_required=True),
-        ProtocolInfo(name="trojan_tcp_tls", description="Trojan+TCP+TLS", port_required=True),
-        ProtocolInfo(name="trojan_grpc_tls", description="Trojan+gRPC+TLS", port_required=True),
-        ProtocolInfo(name="vmess_ws_tls", description="VMess+WS+TLS", port_required=True),
-        ProtocolInfo(name="hysteria", description="Hysteria", port_required=True),
-        ProtocolInfo(name="reality", description="VLESS+Reality", port_required=True),
-        ProtocolInfo(name="tuic", description="Tuic", port_required=True),
-    ]
+@app.post("/services/{service}/control", tags=["Services"])
+async def control_service(service: str, request: ServiceControlRequest):
+    """Control a specific service (start/stop/restart)"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    valid_services = ["xray", "v2ray", "hysteria", "tuic"]
+    if service not in valid_services:
+        raise HTTPException(status_code=400, detail=f"Invalid service. Valid services: {valid_services}")
+    
+    command = f"systemctl {request.action} {service}"
+    result = await run_shell_command(command)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to {request.action} {service}: {result['stderr']}"
+        )
+    
+    return {
+        "message": f"Successfully {request.action}ed {service}",
+        "service": service,
+        "action": request.action
+    }
 
-# User Management
-@app.get("/api/users", response_model=List[User])
+@app.get("/users", response_model=List[User], tags=["User Management"])
 async def get_users():
-    """Get all users from configuration"""
-    try:
-        users = await config_parser.get_all_users()
-        return users
-    except Exception as e:
-        logger.error(f"Error getting users: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get list of all configured users"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    users = []
+    
+    # Parse Xray config files for users
+    config_files = [
+        "02_VLESS_TCP_inbounds.json",
+        "03_VMess_WS_inbounds.json",
+        "04_trojan_TCP_inbounds.json",
+        "07_VLESS_vision_reality_inbounds.json"
+    ]
+    
+    for config_file in config_files:
+        config_path = f"{CONFIG_PATH}/{config_file}"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                if 'inbounds' in config:
+                    for inbound in config['inbounds']:
+                        if 'settings' in inbound and 'clients' in inbound['settings']:
+                            for client in inbound['settings']['clients']:
+                                protocol = "vless" if "VLESS" in config_file else "vmess" if "VMess" in config_file else "trojan"
+                                users.append(User(
+                                    email=client.get('email', 'unknown'),
+                                    uuid=client.get('id', client.get('password', 'unknown')),
+                                    protocol=protocol
+                                ))
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse {config_file}")
+            except Exception as e:
+                logger.error(f"Error reading {config_file}: {e}")
+    
+    return users
 
-@app.post("/api/users", response_model=User)
-async def add_user(user_request: UserCreateRequest):
-    """Add new user using original script"""
-    try:
-        user = await script_wrapper.add_user(user_request)
-        return user
-    except Exception as e:
-        logger.error(f"Error adding user: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/users", tags=["User Management"])
+async def add_user(user_request: AddUserRequest, background_tasks: BackgroundTasks):
+    """Add a new user"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Use the v2ray-agent script to add user
+    # This is a simplified approach - in reality, you'd need to interact with the script properly
+    command = f"echo '4\n{user_request.email}\n{user_request.uuid or ''}\n' | {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=60)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to add user: {result['stderr']}"
+        )
+    
+    return {
+        "message": "User added successfully",
+        "email": user_request.email,
+        "protocol": user_request.protocol
+    }
 
-@app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str):
-    """Delete user using original script"""
-    try:
-        result = await script_wrapper.delete_user(user_id)
-        return {"message": f"User {user_id} deleted successfully", "result": result}
-    except Exception as e:
-        logger.error(f"Error deleting user: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.delete("/users/{email}", tags=["User Management"])
+async def delete_user(email: str):
+    """Delete a user by email"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Use the v2ray-agent script to delete user
+    command = f"echo '5\n{email}\n' | {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=60)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete user: {result['stderr']}"
+        )
+    
+    return {"message": f"User {email} deleted successfully"}
 
-# Configuration Management
-@app.get("/api/config", response_model=Dict[str, Any])
-async def get_configuration():
-    """Get current configuration"""
-    try:
-        config = await config_parser.get_full_config()
-        return config
-    except Exception as e:
-        logger.error(f"Error getting configuration: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/logs/{service}", tags=["Logs"])
+async def get_service_logs(service: str, lines: int = 100):
+    """Get logs for a specific service"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    valid_services = ["xray", "v2ray", "hysteria", "tuic", "access", "error"]
+    if service not in valid_services:
+        raise HTTPException(status_code=400, detail=f"Invalid service. Valid services: {valid_services}")
+    
+    if service in ["access", "error"]:
+        log_file = f"{V2RAY_AGENT_PATH}/{service}.log"
+        if not os.path.exists(log_file):
+            return {"logs": "", "message": f"Log file {log_file} does not exist"}
+        
+        command = f"tail -n {lines} {log_file}"
+    else:
+        command = f"journalctl -u {service} -n {lines} --no-pager"
+    
+    result = await run_shell_command(command)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get logs: {result['stderr']}"
+        )
+    
+    return {
+        "service": service,
+        "logs": result["stdout"],
+        "lines": lines
+    }
 
-@app.get("/api/config/accounts", response_model=List[AccountInfo])
-async def get_accounts():
-    """Get account information with connection details"""
-    try:
-        accounts = await script_wrapper.show_accounts()
-        return accounts
-    except Exception as e:
-        logger.error(f"Error getting accounts: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Certificate Management
-@app.post("/api/certificates/install")
-async def install_certificate(cert_request: CertificateRequest):
-    """Install SSL certificate"""
-    try:
-        result = await script_wrapper.install_certificate(cert_request)
-        return {"message": "Certificate installation completed", "result": result}
-    except Exception as e:
-        logger.error(f"Error installing certificate: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/certificates/renew")
+@app.post("/certificate/renew", tags=["Certificate"])
 async def renew_certificate():
-    """Renew SSL certificate"""
-    try:
-        result = await script_wrapper.renew_certificate()
-        return {"message": "Certificate renewal completed", "result": result}
-    except Exception as e:
-        logger.error(f"Error renewing certificate: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Renew TLS certificate"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    # Use the v2ray-agent script to renew certificate
+    command = f"echo '9' | {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=120)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to renew certificate: {result['stderr']}"
+        )
+    
+    return {"message": "Certificate renewal initiated"}
 
-# Service Management
-@app.post("/api/services/{service_name}/restart")
-async def restart_service(service_name: str):
-    """Restart specific service"""
-    try:
-        result = await script_wrapper.restart_service(service_name)
-        return {"message": f"Service {service_name} restarted", "result": result}
-    except Exception as e:
-        logger.error(f"Error restarting service {service_name}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/config/backup", tags=["Configuration"])
+async def backup_config():
+    """Create a backup of current configuration"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    backup_dir = f"{V2RAY_AGENT_PATH}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    command = f"cp -r {CONFIG_PATH} {backup_dir}"
+    
+    result = await run_shell_command(command)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create backup: {result['stderr']}"
+        )
+    
+    return {
+        "message": "Configuration backup created",
+        "backup_path": backup_dir
+    }
 
-# Logs
-@app.get("/api/logs/{log_type}")
-async def get_logs(log_type: str, lines: int = 100):
-    """Get service logs"""
-    try:
-        logs = await script_wrapper.get_logs(log_type, lines)
-        return {"logs": logs, "log_type": log_type, "lines": lines}
-    except Exception as e:
-        logger.error(f"Error getting logs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Routing Management
-@app.get("/api/routing/rules", response_model=List[RoutingRule])
-async def get_routing_rules():
-    """Get current routing rules"""
-    try:
-        rules = await config_parser.get_routing_rules()
-        return rules
-    except Exception as e:
-        logger.error(f"Error getting routing rules: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/routing/rules")
-async def add_routing_rule(rule: RoutingRuleRequest):
-    """Add new routing rule"""
-    try:
-        result = await script_wrapper.add_routing_rule(rule)
-        return {"message": "Routing rule added", "result": result}
-    except Exception as e:
-        logger.error(f"Error adding routing rule: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# WARP Management
-@app.get("/api/warp/status")
-async def get_warp_status():
-    """Get WARP configuration status"""
-    try:
-        status = await script_wrapper.get_warp_status()
-        return status
-    except Exception as e:
-        logger.error(f"Error getting WARP status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/warp/configure")
-async def configure_warp(warp_config: WarpConfigRequest):
-    """Configure WARP routing"""
-    try:
-        result = await script_wrapper.configure_warp(warp_config)
-        return {"message": "WARP configured successfully", "result": result}
-    except Exception as e:
-        logger.error(f"Error configuring WARP: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Subscriptions
-@app.get("/api/subscriptions", response_model=List[SubscriptionInfo])
-async def get_subscriptions():
-    """Get subscription information"""
-    try:
-        subscriptions = await script_wrapper.get_subscriptions()
-        return subscriptions
-    except Exception as e:
-        logger.error(f"Error getting subscriptions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/subscriptions")
-async def create_subscription(sub_request: SubscriptionCreateRequest):
-    """Create new subscription"""
-    try:
-        subscription = await script_wrapper.create_subscription(sub_request)
-        return subscription
-    except Exception as e:
-        logger.error(f"Error creating subscription: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/update", tags=["System"])
+async def update_v2ray_agent():
+    """Update v2ray-agent to latest version"""
+    if not check_installation():
+        raise HTTPException(status_code=404, detail="V2Ray Agent not installed")
+    
+    command = f"echo '17' | {INSTALL_SCRIPT_PATH}"
+    
+    result = await run_shell_command(command, timeout=180)
+    
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update v2ray-agent: {result['stderr']}"
+        )
+    
+    return {"message": "V2Ray Agent update initiated"}
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.DEBUG,
-        log_level="info"
-    )
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
